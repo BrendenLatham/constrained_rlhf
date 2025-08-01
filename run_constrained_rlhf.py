@@ -139,7 +139,7 @@ def dual_loop(args):
 
         # dual PGD step
         gap = r2.mean() - args.epsilon  # positive ⇒ over‑satisfy constraint
-        lambda_ = torch.clamp(lambda_ - alpha * (-gap), 0.0, args.lambda_cap)
+        lambda_ = torch.clamp(lambda_ - alpha * (-1*gap), 0.0, args.lambda_cap)
 
         if (step + 1) % args.log_every == 0:
             print(
