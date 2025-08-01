@@ -105,11 +105,10 @@ def projected_gradient_descent(df, phi, theta1_hat, theta2_hat, eta, epsilon, La
     lam = torch.tensor(0.0, device=device)
     lambda_vals = []
     num_states, num_actions, _ = phi.shape
-    num_states = phi.shape[0]
-    counts = df["x"].value_counts().sort_index()
-    d0 = torch.zeros(num_states, device=pi.device)
-    d0[counts.index.to_numpy()] = torch.tensor(counts.values / counts.values.sum(), device=pi.device)
 
+    counts = torch.bincount(torch.tensor(df["x"].values), minlength=num_states)
+    d0 = counts.float() / counts.sum()
+    d0 = d0.to(device)
 
     def grad_dual(lam):
         theta_mix = theta1_hat + lam * theta2_hat
@@ -128,6 +127,7 @@ def projected_gradient_descent(df, phi, theta1_hat, theta2_hat, eta, epsilon, La
         lambda_vals.append(lam.item())
 
     return lambda_vals, lam.item()
+
 
 def main():
     parser = argparse.ArgumentParser()
