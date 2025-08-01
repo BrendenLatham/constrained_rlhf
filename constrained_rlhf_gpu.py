@@ -1,105 +1,137 @@
-import torch
-import torch.nn.functional as F
-import pandas as pd
-import numpy as np
 import argparse
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import math
 
-
-def generate_offline_rlhf_dataset(num_states, num_actions, d, N, alpha, eta, seed, device):
+def generate_dataset(states, actions, dim, samples, alpha, seed, device):
     torch.manual_seed(seed)
-    phi = torch.randn(num_states, num_actions, d, device=device)
-    phi = phi / phi.norm(dim=2, keepdim=True)
+    np.random.seed(seed)
 
-    theta1_star = torch.randn(d, device=device)
-    theta1_star /= theta1_star.norm()
+    phi = torch.randn(states, actions, dim, device=device)
+    phi = phi / torch.norm(phi, dim=2, keepdim=True)
 
-    theta2_star = torch.randn(d, device=device)
-    theta2_star /= theta2_star.norm()
+    theta1_star = torch.randn(dim, device=device)
+    theta1_star = theta1_star / torch.norm(theta1_star)
+
+    theta2_star = torch.randn(dim, device=device)
+    theta2_star = theta2_star / torch.norm(theta2_star)
 
     theta0 = alpha * theta1_star + (1 - alpha) * theta2_star
-    logits = torch.einsum("sad,d->sa", phi, theta0)
-    pi_0_probs = F.softmax(logits / eta, dim=1)
 
-    x = torch.randint(0, num_states, (N,), device=device)
-    pi_x = pi_0_probs[x]
-    a_choices = torch.multinomial(pi_x, 2, replacement=True)
-    a1, a2 = a_choices[:, 0], a_choices[:, 1]
+    def pi_0(x):
+        logits = (phi[x] @ theta0) / eta
+        probs = torch.softmax(logits, dim=0)
+        return probs
 
-    def oracle_pref(theta):
-        r1 = (phi[x, a1] * theta).sum(dim=1)
-        r2 = (phi[x, a2] * theta).sum(dim=1)
-        probs = torch.sigmoid(r1 - r2)
-        return torch.bernoulli(probs).long()
+    def oracle_preference(x, a1, a2, theta):
+        r1 = torch.dot(phi[x, a1], theta)
+        r2 = torch.dot(phi[x, a2], theta)
+        p = torch.sigmoid(r1 - r2).item()
+        return np.random.binomial(1, p)
 
-    y1 = oracle_pref(theta1_star)
-    y2 = oracle_pref(theta2_star)
+    data = []
+    for _ in range(samples):
+        x = np.random.randint(states)
+        probs = pi_0(x).cpu().numpy()
+        a1, a2 = np.random.choice(actions, size=2, replace=True, p=probs)
+        y1 = oracle_preference(x, a1, a2, theta1_star)
+        y2 = oracle_preference(x, a1, a2, theta2_star)
+        data.append((x, a1, a2, y1, y2))
 
-    df = pd.DataFrame({
-        "x": x.cpu().numpy(),
-        "a1": a1.cpu().numpy(),
-        "a2": a2.cpu().numpy(),
-        "y1": y1.cpu().numpy(),
-        "y2": y2.cpu().numpy(),
-    })
+    df = pd.DataFrame(data, columns=["x", "a1", "a2", "y1", "y2"])
     return df, phi, theta1_star, theta2_star, theta0
 
-
-def mle_estimate(df, phi, oracle_col, d, reg=1e-4, device="cuda"):
+def mle_estimate(df, phi, oracle_col, dim, device):
     X, y = [], []
     for _, row in df.iterrows():
-        x, a1, a2, label = int(row["x"]), int(row["a1"]), int(row["a2"]), int(row[oracle_col])
-        phi_diff = (phi[x, a1] - phi[x, a2]).view(-1)  # Ensure shape (d,)
+        x, a1, a2 = int(row["x"]), int(row["a1"]), int(row["a2"])
+        label = int(row[oracle_col])
+        phi_diff = phi[x, a1] - phi[x, a2]  # (d,)
         y_bin = 2 * label - 1
         X.append(phi_diff)
         y.append(y_bin)
-    X = torch.stack(X).to(device)
-    y = torch.tensor(y, dtype=torch.float32, device=device)
 
-    theta = torch.zeros(d, device=device, requires_grad=True)
-    optimizer = torch.optim.LBFGS([theta], max_iter=100, line_search_fn="strong_wolfe")
+    X = torch.stack(X).to(device)  # (N, d)
+    y = torch.tensor(y, dtype=torch.float32, device=device)  # (N,)
+
+    theta = torch.zeros(dim, device=device, requires_grad=True)
+    optimizer = optim.LBFGS([theta], max_iter=100)
 
     def closure():
         optimizer.zero_grad()
-        margins = y * X @ theta
-        log_likelihood = -torch.mean(F.softplus(-margins))
-        reg_term = 0.5 * reg * torch.sum(theta ** 2)
-        loss = -log_likelihood + reg_term
+        margins = y * (X @ theta)  # (N,)
+        loss = torch.mean(torch.nn.functional.softplus(-margins))
         loss.backward()
         return loss
 
     optimizer.step(closure)
     return theta.detach()
 
-
-def compute_gibbs_policy(phi, theta_mix, eta):
-    logits = torch.einsum("sad,d->sa", phi, theta_mix)
-    probs = F.softmax(logits / eta, dim=1)
+def pi_lambda(phi, x, theta_mix, eta):
+    logits = phi[x] @ theta_mix
+    logits = logits - logits.max()
+    probs = torch.softmax(logits / eta, dim=0)
     return probs
 
+def evaluate_policy(df, pi, phi, theta1_star, theta2_star, theta0, eta, epsilon):
+    num_states, num_actions, _ = phi.shape
+    d0 = df["x"].value_counts(normalize=True).sort_index().values
+    d0 = torch.tensor(d0, device=pi.device)
 
-def compute_regularized_objective(pi, phi, theta1_star, theta0, eta, state_dist):
-    logits0 = torch.einsum("sad,d->sa", phi, theta0) / eta
-    pi0 = F.softmax(logits0, dim=1)
-    log_ratio = torch.log(pi + 1e-12) - torch.log(pi0 + 1e-12)
+    J = 0.0
+    KL = 0.0
+    constraint_val = 0.0
+    for x in range(num_states):
+        pi_x = pi[x]
+        logits0 = phi[x] @ theta0 / eta
+        pi0_x = torch.softmax(logits0, dim=0)
 
-    reward_term = (pi * torch.einsum("sad,d->sa", phi, theta1_star)).sum(dim=1)
-    kl_term = (pi * log_ratio).sum(dim=1)
-    J = (reward_term - eta * kl_term) @ state_dist
-    return J.item()
+        for a in range(num_actions):
+            p = pi_x[a]
+            log_ratio = torch.log(p + 1e-12) - torch.log(pi0_x[a] + 1e-12)
+            J += d0[x] * p * torch.dot(theta1_star, phi[x, a])
+            KL += d0[x] * p * log_ratio
+            constraint_val += d0[x] * p * torch.dot(theta2_star, phi[x, a])
 
+    reg_J = J - eta * KL
+    constraint_violation = epsilon - constraint_val
+    return reg_J.item(), constraint_violation.item()
 
-def compute_constraint_violation(pi, phi, theta2_star, epsilon, state_dist):
-    r2_expectation = (pi * torch.einsum("sad,d->sa", phi, theta2_star)).sum(dim=1)
-    constraint_val = r2_expectation @ state_dist
-    return epsilon - constraint_val.item(), constraint_val.item()
+def projected_gradient_descent(df, phi, theta1_hat, theta2_hat, eta, epsilon, Lambda, T, device):
+    lam = torch.tensor(0.0, device=device)
+    lambda_vals = []
+    num_states, num_actions, _ = phi.shape
+    d0 = df["x"].value_counts(normalize=True).sort_index().values
+    d0 = torch.tensor(d0, device=device)
 
+    def grad_dual(lam):
+        theta_mix = theta1_hat + lam * theta2_hat
+        grad = 0.0
+        for x in range(num_states):
+            pi_x = pi_lambda(phi, x, theta_mix, eta)
+            for a in range(num_actions):
+                grad += d0[x] * pi_x[a] * torch.dot(theta2_hat, phi[x, a])
+        return grad - epsilon
+
+    step_size = eta / (torch.max(torch.abs(phi @ theta2_hat)) ** 2 + 1e-8)
+    for _ in range(T):
+        g = grad_dual(lam)
+        lam = lam - step_size * g
+        lam = torch.clamp(lam, 0, Lambda)
+        lambda_vals.append(lam.item())
+
+    return lambda_vals, lam.item()
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--states", type=int, default=100)
     parser.add_argument("--actions", type=int, default=10)
     parser.add_argument("--dim", type=int, default=10)
-    parser.add_argument("--samples", type=int, default=10000)
+    parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--eta", type=float, default=0.05)
     parser.add_argument("--epsilon", type=float, default=0.5)
@@ -107,35 +139,34 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lambda_init", type=float, default=1.0)
     parser.add_argument("--delta", type=float, default=0.05)
-    parser.add_argument("--T", type=int, default=1000)
-    parser.add_argument("--step_size", type=float, default=None)
+    parser.add_argument("--T", type=int, default=100)
     args = parser.parse_args()
 
-    device = torch.device(args.device)
-    df, phi, theta1_star, theta2_star, theta0 = generate_offline_rlhf_dataset(
-        args.states, args.actions, args.dim, args.samples,
-        args.alpha, args.eta, args.seed, device
+    global eta
+    eta = args.eta
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    df, phi, theta1_star, theta2_star, theta0 = generate_dataset(
+        args.states, args.actions, args.dim, args.samples, args.alpha, args.seed, device
     )
 
-    theta1_hat = mle_estimate(df, phi, "y1", args.dim, device=device)
-    theta2_hat = mle_estimate(df, phi, "y2", args.dim, device=device)
+    theta1_hat = mle_estimate(df, phi, "y1", args.dim, device)
+    theta2_hat = mle_estimate(df, phi, "y2", args.dim, device)
 
-    print("\nMLE estimation complete.")
+    Lambda = args.lambda_init
+    lambda_vals, avg_lambda = projected_gradient_descent(
+        df, phi, theta1_hat, theta2_hat, args.eta, args.epsilon, Lambda, args.T, device
+    )
 
-    theta_mix = theta1_hat + theta2_hat  # Example: λ=1
-    pi_hat = compute_gibbs_policy(phi, theta_mix, args.eta)
+    pi_hat = torch.stack([
+        pi_lambda(phi, x, theta1_hat + avg_lambda * theta2_hat, args.eta)
+        for x in range(args.states)
+    ])
 
-    state_counts = df["x"].value_counts(normalize=True).sort_index()
-    state_dist = torch.tensor([state_counts.get(i, 0.0) for i in range(args.states)], device=device)
-
-    J_hat = compute_regularized_objective(pi_hat, phi, theta1_star, theta0, args.eta, state_dist)
-    violation, constraint_val = compute_constraint_violation(pi_hat, phi, theta2_star, args.epsilon, state_dist)
-
-    print("\nLearned policy performance:")
-    print("J(pi):", J_hat)
-    print("Constraint value:", constraint_val)
-    print("Constraint violation:", violation)
-
+    J, v = evaluate_policy(df, pi_hat, phi, theta1_star, theta2_star, theta0, args.eta, args.epsilon)
+    print("Learned Regularized J:", J)
+    print("Constraint Violation:", v)
 
 if __name__ == "__main__":
     main()
