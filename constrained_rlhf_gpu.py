@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
+import tqdm as tqdm
 import math
 
 def generate_dataset(states, actions, dim, samples, alpha, seed, device):
