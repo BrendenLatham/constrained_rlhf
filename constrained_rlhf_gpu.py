@@ -142,34 +142,47 @@ def evaluate_policy(df, pi, phi,
 def projected_gradient_descent(df, phi,
                                theta1_hat, theta2_hat,
                                eta, epsilon,
-                               lambda_cap, steps, device):
-    lam = torch.tensor(0.0, device=device)    # dual variable λ ≥ 0
-    lambda_history = []
+                               lambda_cap, steps,
+                               device,
+                               early_stop_tol=None):
+    """
+    Vectorised PGD: O(S·A) per step instead of O(S·A + Python).
+    """
+    lam = torch.tensor(0.0, device=device)         # dual variable
+    lambda_hist = []
 
     states, actions, _ = phi.shape
-    counts = torch.bincount(torch.tensor(df["x"].values),
-                            minlength=states).float()
-    d0 = (counts / counts.sum()).to(device)   # (S,)
 
-    # Lipschitz constant upper-bound for safe step-size
-    L = torch.max(torch.abs((phi @ theta2_hat).flatten()))
+    counts = torch.bincount(
+        torch.tensor(df["x"].values), minlength=states
+    ).float()
+    d0 = (counts / counts.sum()).to(device)        # (S,)
+
+    # Pre-compute feature–theta2 term once: (S, A)
+    phi_theta2 = phi @ theta2_hat
+
+    # Safe step-size (same derivation)
+    L = torch.max(torch.abs(phi_theta2))
     step_size = eta / (L ** 2 + 1e-8)
 
-    def dual_gradient(lam_value):
-        theta_mix = theta1_hat + lam_value * theta2_hat
-        g = torch.tensor(0.0, device=device)
-        for x in range(states):
-            pi_x = pi_lambda(phi, x, theta_mix, eta)
-            g += d0[x] * torch.sum(pi_x * (phi[x] @ theta2_hat))
-        return g - epsilon                    # scalar tensor
-
     for _ in range(steps):
-        grad = dual_gradient(lam)
-        lam = lam - step_size * grad          # gradient step
-        lam = torch.clamp(lam, 0.0, lambda_cap)
-        lambda_history.append(lam.item())
+        # ---- compute grad g(λ) in a single kernel ------------------------ #
+        theta_mix = theta1_hat + lam * theta2_hat            # (d,)
+        logits = phi @ theta_mix                             # (S, A)
+        logits = logits - logits.max(dim=1, keepdim=True).values
+        pi = torch.softmax(logits / eta, dim=1)              # (S, A)
 
-    return lambda_history, lam.item()
+        g = torch.sum(d0[:, None] * pi * phi_theta2) - epsilon   # scalar
+        lam = lam - step_size * g
+        lam = torch.clamp(lam, 0.0, lambda_cap)
+
+        lambda_hist.append(lam.item())
+
+        if early_stop_tol is not None and torch.abs(g) < early_stop_tol:
+            break
+
+    return lambda_hist, lam.item()
+
 
 
 # --------------------------------------------------------------------------- #
