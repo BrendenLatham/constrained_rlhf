@@ -48,7 +48,7 @@ def mle_estimate(df, phi, oracle_col, d, reg=1e-4, device="cuda"):
     X, y = [], []
     for _, row in df.iterrows():
         x, a1, a2, label = int(row["x"]), int(row["a1"]), int(row["a2"]), int(row[oracle_col])
-        phi_diff = phi[x, a1] - phi[x, a2]
+        phi_diff = (phi[x, a1] - phi[x, a2]).view(-1)  # Ensure shape (d,)
         y_bin = 2 * label - 1
         X.append(phi_diff)
         y.append(y_bin)
